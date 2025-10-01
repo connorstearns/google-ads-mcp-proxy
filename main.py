@@ -15,7 +15,7 @@ HOP_BY_HOP = {
     "trailers",
     "transfer-encoding",
     "upgrade",
-    "content-length",         # <-- never forward
+    "content-length",  # <-- never forward
 }
 
 app = FastAPI()
@@ -23,6 +23,26 @@ app = FastAPI()
 def _filtered_headers(src: httpx.Headers) -> dict:
     # Copy safe headers from upstream response to client response
     return {k: v for k, v in src.items() if k.lower() not in HOP_BY_HOP}
+
+def _filtered_request_headers(src: httpx.Headers) -> dict:
+    """Forward client headers downstream, minus hop-by-hop/auth details."""
+
+    allowed = {}
+    for key, value in src.items():
+        lowered = key.lower()
+        if lowered in HOP_BY_HOP:
+            continue
+        if lowered in {"authorization", "host"}:
+            # Replace with proxy credentials / let httpx manage Host.
+            continue
+        allowed[key] = value
+    return allowed
+
+
+def _backend_url(path: str) -> str:
+    if not path:
+        return MCP_URL
+    return MCP_URL + path
 
 @app.get("/")
 def health():
@@ -43,8 +63,11 @@ async def discovery(req: Request):
     # Forward discovery GET to backend; do NOT copy hop-by-hop headers back
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            MCP_URL + ".well-known/mcp.json",
-            headers={"Authorization": f"Bearer {MCP_KEY}"},
+            _backend_url(".well-known/mcp.json"),
+            headers={
+                **_filtered_request_headers(req.headers),
+                "Authorization": f"Bearer {MCP_KEY}",
+            },
         )
     # Let FastAPI compute content length; set media_type only
     return Response(
@@ -58,9 +81,11 @@ async def discovery(req: Request):
 async def list_tools(req: Request):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            MCP_URL + "mcp/tools",
-            headers={"Authorization": f"Bearer {MCP_KEY}"},
-        )
+            _backend_url("mcp/tools"),
+            headers={
+                **_filtered_request_headers(req.headers),
+                "Authorization": f"Bearer {MCP_KEY}",
+            },
     return Response(
         content=r.content,
         status_code=r.status_code,
@@ -68,21 +93,18 @@ async def list_tools(req: Request):
         headers=_filtered_headers(r.headers),
     )
 
-@app.post("/")
-async def forward(req: Request):
+@app.post("/{path:path}")
+async def forward(path: str, req: Request):
     body = await req.body()
 
     # Build headers for backend: inject Bearer, pass MCP-Protocol-Version, and set content-type.
-    fwd_headers = {
-        "Authorization": f"Bearer {MCP_KEY}",
-        "Content-Type": "application/json",
-    }
-    proto = req.headers.get("MCP-Protocol-Version")
-    if proto:
-        fwd_headers["MCP-Protocol-Version"] = proto
+    fwd_headers = _filtered_request_headers(req.headers)
+    content_type = req.headers.get("content-type", "application/json")
+    fwd_headers["Content-Type"] = content_type
+    fwd_headers["Authorization"] = f"Bearer {MCP_KEY}"
 
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(MCP_URL, content=body, headers=fwd_headers)
+        r = await client.post(_backend_url(path), content=body, headers=fwd_headers)
 
     # Return exactly the backend body. DO NOT set content_length manually.
     return Response(
