@@ -1,60 +1,55 @@
 import os, httpx
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-BACKEND = os.environ["MCP_BACKEND_URL"].rstrip("/")  # e.g. https://mcp-google-ads-...run.app
-MCP_KEY  = os.environ["MCP_SHARED_KEY"]
+MCP_URL = os.environ["MCP_BACKEND_URL"].rstrip("/")  # no trailing slash
+MCP_KEY = os.environ["MCP_SHARED_KEY"]
+PROXY_VERSION = os.getenv("PROXY_VERSION", "0.2.0")
 
 app = FastAPI()
 
-def _make_headers(in_headers):
-    # Start with inbound headers, but force auth and ensure protocol header passes through.
-    h = {k: v for k, v in in_headers.items()}
-    h["Authorization"] = f"Bearer {MCP_KEY}"
-    # Be explicit about JSON on POSTs; harmless on GETs.
-    h["Content-Type"] = "application/json"
-    return h
-
-def _passthru_headers(upstream):
-    # Return only safe/needed headers. Include MCP-Protocol-Version if backend sets it.
-    allowed = {"content-type", "cache-control", "mcp-protocol-version"}
-    return {k: v for k, v in upstream.headers.items() if k.lower() in allowed}
+def _auth_headers():
+    return {
+        "Authorization": f"Bearer {MCP_KEY}",
+        "Content-Type": "application/json",
+        "MCP-Protocol-Version": os.getenv("MCP_PROTO_DEFAULT", "2024-11-05"),
+    }
 
 @app.get("/")
-def health():
-    return {"ok": True, "proxy_for": BACKEND}
+async def health():
+    return {
+        "ok": True,
+        "version": PROXY_VERSION,
+        "backend_set": bool(MCP_URL),
+        "auth_set": bool(MCP_KEY),
+        "proxy_for": MCP_URL + "/",
+    }
 
-# ---- GET passthroughs required by MCP clients ----
+@app.get("/whoami")
+async def whoami():
+    return {"proxy_version": PROXY_VERSION, "proxy_for": MCP_URL + "/"}
+
+# --- Discovery passthroughs (GET) ---
 @app.get("/.well-known/mcp.json")
-async def discovery(req: Request):
-    url = f"{BACKEND}{req.url.path}"
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(url, headers=_make_headers(req.headers), params=req.query_params)
-    return Response(content=r.content, status_code=r.status_code, headers=_passthru_headers(r))
-
-@app.head("/.well-known/mcp.json")
-async def discovery_head(req: Request):
-    url = f"{BACKEND}{req.url.path}"
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.head(url, headers=_make_headers(req.headers), params=req.query_params)
-    return Response(content=b"", status_code=r.status_code, headers=_passthru_headers(r))
+async def discovery():
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(MCP_URL + "/.well-known/mcp.json", headers=_auth_headers())
+    return JSONResponse(status_code=r.status_code, content=r.json())
 
 @app.get("/mcp/tools")
-async def tools(req: Request):
-    url = f"{BACKEND}{req.url.path}"
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(url, headers=_make_headers(req.headers), params=req.query_params)
-    return Response(content=r.content, status_code=r.status_code, headers=_passthru_headers(r))
+async def tools_list():
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(MCP_URL + "/mcp/tools", headers=_auth_headers())
+    return JSONResponse(status_code=r.status_code, content=r.json())
 
-# ---- JSON-RPC POST passthrough ----
+# --- JSON-RPC passthrough (POST /) ---
 @app.post("/")
 async def forward(req: Request):
     body = await req.body()
-    url = f"{BACKEND}/"
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, content=body, headers=_make_headers(req.headers))
-    # Try to keep JSON semantics; fall back to bytes if upstream wasn’t JSON
+        r = await client.post(MCP_URL + "/", content=body, headers=_auth_headers())
+    # pass through JSON (or text if backend error isn’t JSON)
     try:
-        return JSONResponse(status_code=r.status_code, content=r.json(), headers=_passthru_headers(r))
+        return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception:
-        return Response(content=r.content, status_code=r.status_code, headers=_passthru_headers(r))
+        return JSONResponse(status_code=r.status_code, content={"detail": r.text})
