@@ -1,94 +1,67 @@
-import os
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import Response, JSONResponse, PlainTextResponse
+# proxy/main.py
+import os, uuid, json, httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-MCP_URL = os.environ["MCP_BACKEND_URL"].rstrip("/") + "/"
-MCP_KEY = os.environ["MCP_SHARED_KEY"]
-MCP_PROTO_DEFAULT = os.getenv("MCP_PROTO_DEFAULT", "2024-11-05")
+MCP_URL  = os.environ["MCP_BACKEND_URL"].rstrip("/")  # e.g. https://mcp-google-ads-...run.app
+MCP_KEY  = os.environ["MCP_SHARED_KEY"]
+PROTO    = os.getenv("MCP_PROTO_DEFAULT", "2024-11-05")
 
 app = FastAPI()
 
-# --- ALWAYS add MCP-Protocol-Version to every response ---
-@app.middleware("http")
-async def ensure_mcp_header(request: Request, call_next):
-    resp = await call_next(request)
-    # If the downstream handler didn't set it, add it here.
-    if "MCP-Protocol-Version" not in resp.headers:
-        resp.headers["MCP-Protocol-Version"] = (
-            request.headers.get("MCP-Protocol-Version") or MCP_PROTO_DEFAULT
-        )
-    # Make sure JSON RPC responses keep JSON content-type
-    if request.method == "POST" and request.url.path == "/":
-        # Only enforce on the JSON-RPC endpoint
-        ct = resp.headers.get("content-type", "")
-        if "application/json" not in ct.lower():
-            resp.headers["content-type"] = "application/json"
-    return resp
+def _auth_headers(extra: dict | None = None) -> dict:
+    h = {
+        "Authorization": f"Bearer {MCP_KEY}",
+        "MCP-Protocol-Version": PROTO,
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+def _client() -> httpx.AsyncClient:
+    # generous but bounded timeouts; Cloud Run default request timeout is higher
+    return httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0, read=25.0))
 
 @app.get("/")
-def health():
-    # Health is fine to keep simple; middleware will still add MCP-Protocol-Version
+async def health():
     return {"ok": True, "proxy_for": MCP_URL}
 
-# --- Debug helpers ---
-@app.get("/headers", include_in_schema=False)
-def headers(req: Request):
-    # Shows headers the PROXY received from the client
-    return JSONResponse({"headers": dict(req.headers)})
+@app.get("/.well-known/mcp.json")
+async def discovery():
+    # Forward with auth so the client "sees" the gated tools
+    async with _client() as client:
+        r = await client.get(f"{MCP_URL}/.well-known/mcp.json", headers=_auth_headers())
+    # Pass through status/headers + JSON
+    try:
+        data = r.json()
+        return JSONResponse(status_code=r.status_code, content=data, headers={"MCP-Protocol-Version": PROTO})
+    except Exception:
+        return PlainTextResponse(r.text, status_code=r.status_code)
 
-@app.post("/echo", include_in_schema=False)
-async def echo(req: Request):
-    # Echos request body as text
-    b = await req.body()
-    return PlainTextResponse(b.decode("utf-8"), media_type="text/plain")
-
-@app.get("/via", include_in_schema=False)
-async def via(req: Request):
-    # Calls backend /headers so you can see what the BACKEND received
-    fwd_headers = {
-        "Authorization": f"Bearer {MCP_KEY}",
-        "MCP-Protocol-Version": req.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT),
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-        r = await client.get(MCP_URL.rstrip("/") + "/headers", headers=fwd_headers)
-    return Response(content=r.content, status_code=r.status_code, headers={"content-type": "application/json"})
-
-# --- JSON-RPC forwarder ---
 @app.post("/")
-async def forward(req: Request):
+async def rpc(req: Request):
     body = await req.body()
+    trace_id = str(uuid.uuid4())
+    fwd_headers = _auth_headers({"Content-Type": "application/json", "X-Trace-Id": trace_id})
 
-    # Forward auth + MCP header + JSON content-type to backend
-    fwd_headers = {
-        "Authorization": f"Bearer {MCP_KEY}",
-        "Content-Type": "application/json",
-    }
-    in_mcp = req.headers.get("MCP-Protocol-Version")
-    if in_mcp:
-        fwd_headers["MCP-Protocol-Version"] = in_mcp
+    async with _client() as client:
+        r = await client.post(f"{MCP_URL}/", content=body, headers=fwd_headers)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        backend = await client.post(MCP_URL, headers=fwd_headers, content=body)
+    # make sure we always return application/json when upstream is JSON
+    try:
+        content = r.json()
+        # add trace id into result (non-invasive)
+        if isinstance(content, dict) and "result" in content and isinstance(content["result"], dict):
+            # append tiny diagnostic crumb the client can ignore
+            result = content["result"]
+            if "content" in result and isinstance(result["content"], list):
+                result["content"].append({"type": "json", "json": {"_trace": trace_id}})
+        return JSONResponse(status_code=r.status_code, content=content, headers={"MCP-Protocol-Version": PROTO})
+    except Exception:
+        return PlainTextResponse(r.text, status_code=r.status_code)
 
-    # Return backend response AS-IS (don’t JSON-encode again)
-    out_headers = {}
-    out_headers["Content-Type"] = backend.headers.get("content-type", "application/json")
-
-    # Prefer backend’s MCP header; otherwise mirror request’s or default
-    out_headers["MCP-Protocol-Version"] = (
-        backend.headers.get("MCP-Protocol-Version")
-        or in_mcp
-        or MCP_PROTO_DEFAULT
-    )
-
-    # Optional passthroughs
-    for h in ("Cache-Control", "Vary", "ETag"):
-        if h in backend.headers:
-            out_headers[h] = backend.headers[h]
-
-    return Response(
-        content=backend.content,
-        status_code=backend.status_code,
-        headers=out_headers,
-    )
+# Optional: tiny echo for debugging the proxy layer only
+@app.post("/echo")
+async def echo(req: Request):
+    body = await req.json()
+    return {"ok": True, "you_sent": body}
