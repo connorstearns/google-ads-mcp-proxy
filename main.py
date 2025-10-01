@@ -1,4 +1,5 @@
 import os, httpx
+from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -39,10 +40,12 @@ def _filtered_request_headers(src: httpx.Headers) -> dict:
     return allowed
 
 
-def _backend_url(path: str) -> str:
-    if not path:
-        return MCP_URL
-    return MCP_URL + path
+def _backend_url(path: str, query: Optional[str] = None) -> str:
+    base = MCP_URL + path if path else MCP_URL
+    if query:
+        separator = "&" if "?" in base else "?"
+        return f"{base}{separator}{query}"
+    return base
 
 @app.get("/")
 def health():
@@ -63,7 +66,7 @@ async def discovery(req: Request):
     # Forward discovery GET to backend; do NOT copy hop-by-hop headers back
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            _backend_url(".well-known/mcp.json"),
+            _backend_url(".well-known/mcp.json", req.url.query or None),
             headers={
                 **_filtered_request_headers(req.headers),
                 "Authorization": f"Bearer {MCP_KEY}",
@@ -81,11 +84,12 @@ async def discovery(req: Request):
 async def list_tools(req: Request):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            _backend_url("mcp/tools"),
+            _backend_url("mcp/tools", req.url.query or None),
             headers={
                 **_filtered_request_headers(req.headers),
                 "Authorization": f"Bearer {MCP_KEY}",
             },
+        )
     return Response(
         content=r.content,
         status_code=r.status_code,
@@ -104,7 +108,8 @@ async def forward(path: str, req: Request):
     fwd_headers["Authorization"] = f"Bearer {MCP_KEY}"
 
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(_backend_url(path), content=body, headers=fwd_headers)
+        backend_url = _backend_url(path, req.url.query or None)
+        r = await client.post(backend_url, content=body, headers=fwd_headers)
 
     # Return exactly the backend body. DO NOT set content_length manually.
     return Response(
